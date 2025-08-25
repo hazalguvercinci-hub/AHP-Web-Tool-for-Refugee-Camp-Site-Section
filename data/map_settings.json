@@ -1,0 +1,7 @@
+﻿{
+    "enable_map": true,
+    "size_by": "global_score",
+    "export_geojson": true,
+    "crs": "EPSG:4326",
+    "skip_map_option": true
+}

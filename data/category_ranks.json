@@ -1,0 +1,12 @@
+{
+    "rank_scale": { "5": 5, "4": 4, "3": 3, "2": 2, "1": 1 },
+    "category_ranks": [
+      {"name": "Accessibility & Infrastructure", "rank": 5},
+      {"name": "Physical & Environmental", "rank": 4},
+      {"name": "Socio-Economic and Social Factors", "rank": 3},
+      {"name": "Security", "rank": 2},
+      {"name": "Governance & Legal Status", "rank": 1}
+    ],
+    "normalization": "global"
+  }
+  

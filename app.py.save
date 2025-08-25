@@ -1,0 +1,540 @@
+# app.py — Refugee Camp Site Feasibility AHP Tool (flow v1)
+# Hazal + ChatGPT
+# Çalıştır: streamlit run app.py
+# Gerekli paketler: streamlit pandas numpy plotly kaleido reportlab python-docx openpyxl
+
+import json, os, io, math, time
+from datetime import datetime
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from docx import Document
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+
+# ---------- Yardımcılar
+
+APP_TITLE = "Refugee Camp Site Feasibility — AHP Tool"
+DATA_DIR = "data"
+OUT_DIR = "outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RI_TABLE = {1:0.00,2:0.00,3:0.58,4:0.90,5:1.12,6:1.24,7:1.32,8:1.41,9:1.45,10:1.49}
+
+def load_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def load_docx_lines(path):
+    """DOCX dosyasında her paragrafı tek soru cümlesi varsayar."""
+    doc = Document(path)
+    lines = []
+    for p in doc.paragraphs:
+        t = p.text.strip()
+        if t:
+            lines.append(t)
+    return lines
+
+def load_categories_from_excel(path):
+    """Beklenen kolonlar: Category, Subcriterion, (opsiyonel) BaseWeight"""
+    df = pd.read_excel(path)
+    # Kolon isimlerini basitleştir
+    cols = {c.strip().lower(): c for c in df.columns}
+    cat_col = cols.get("category")
+    sub_col = cols.get("subcriterion") or cols.get("sub-criterion")
+    base_col = cols.get("baseweight") or cols.get("base_weight")
+    if not cat_col or not sub_col:
+        raise ValueError("Excel'de 'Category' ve 'Subcriterion' kolonları olmalı.")
+    df = df[[cat_col, sub_col] + ([base_col] if base_col else [])].copy()
+    df.columns = ["Category", "Subcriterion"] + (["BaseWeight"] if base_col else [])
+    return df
+
+def normalize(v: np.ndarray) -> np.ndarray:
+    s = v.sum()
+    return v if s == 0 else v / s
+
+def ahp_from_pairs(names: List[str], pairs: Dict[Tuple[int,int], Tuple[int,int]]):
+    """
+    pairs[(i,j)] = (better_index, intensity 1..9). intensity=1 -> equal.
+    Döner: A (nxn), weights {name: w}, CR
+    """
+    n = len(names)
+    A = np.ones((n,n), dtype=float)
+    for i in range(n):
+        for j in range(i+1, n):
+            better, intensity = pairs.get((i,j), (i,1))
+            intensity = int(max(1, min(9, intensity)))
+            if intensity == 1:
+                val = 1.0
+            else:
+                val = float(intensity)
+            if better == i:
+                A[i,j] = val; A[j,i] = 1.0/val
+            elif better == j:
+                A[i,j] = 1.0/val; A[j,i] = val
+            else:
+                A[i,j] = 1.0; A[j,i] = 1.0
+
+    # geometric mean
+    gm = np.prod(A, axis=1) ** (1.0/n)
+    w = normalize(gm)
+
+    # CR hesapla (lambda_max approx)
+    Aw = A @ w
+    lambda_max = np.sum(Aw / w) / n
+    CI = (lambda_max - n) / (n - 1) if n > 1 else 0.0
+    RI = RI_TABLE.get(n, 1.49)
+    CR = (CI / RI) if RI > 0 else 0.0
+    weights = {names[i]: float(w[i]) for i in range(n)}
+    return A, weights, float(CR)
+
+def build_scaled_subcriterion_weights(df_cat: pd.DataFrame, ranks_cfg: dict):
+    """
+    Excel'deki alt kriterleri kategori rank katsayıları ile ölçekle.
+    Sonuç: {category:{sub: weight}} toplamı 1 olacak.
+    """
+    rank_map = {c["name"]: c["rank"] for c in ranks_cfg["category_ranks"]}
+    # kategori içi base weight yoksa eşit dağıt
+    rows = []
+    for cat, g in df_cat.groupby("Category"):
+        subs = g["Subcriterion"].tolist()
+        if "BaseWeight" in g.columns and not g["BaseWeight"].isna().all():
+            bw = g["BaseWeight"].fillna(0).astype(float).to_numpy()
+            if bw.sum() <= 0:
+                bw = np.ones(len(subs))
+        else:
+            bw = np.ones(len(subs))
+        bw = normalize(bw)
+        k = float(rank_map.get(cat, 1.0))
+        scaled = bw * k
+        for s, w in zip(subs, scaled):
+            rows.append((cat, s, float(w)))
+
+    # tüm sistemi normalize et (normalization: "global")
+    total = sum(w for _,_,w in rows)
+    rows = [(c, s, (w/total if total>0 else 0.0)) for (c,s,w) in rows]
+
+    tree: Dict[str, Dict[str, float]] = {}
+    for c, s, w in rows:
+        tree.setdefault(c, {})[s] = w
+    return tree
+
+def ensure_state():
+    if "S" not in st.session_state:
+        st.session_state.S = {
+            "project_name": "",
+            "locations": [],              # [{"name":..., "lat":..., "lon":...}]
+            "mandatory": {},              # {loc:{qid:"YES/NO/CONDITIONAL"}}
+            "active_locations": [],
+            "pairwise": {},               # { "Category :: Sub": {"pairs":{(i,j):(better,int)}, "CR":float}}
+            "local_weights": {},          # { "Category :: Sub": {loc: w} }
+            "global_scores": {},          # {loc: score}
+            "category_breakdown": {},     # {loc:{category: score}}
+            "last_saved": None
+        }
+
+# ---------- Konfigürasyon ve veri yükleme
+
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+ensure_state()
+S = st.session_state.S
+
+meta = load_json(os.path.join(DATA_DIR, "report_meta.json"), {
+    "project_default_name": "Refugee Camp Site Feasibility",
+    "org_name": "",
+    "author": "",
+    "include_conditional_notes": True,
+    "language": "en",
+    "date_format": "YYYY-MM-DD",
+    "footer_note": "",
+    "references": []
+})
+
+ranks_cfg = load_json(os.path.join(DATA_DIR, "category_ranks.json"))
+if not ranks_cfg:
+    st.error("data/category_ranks.json bulunamadı. Adım 3'ü kontrol et.")
+    st.stop()
+
+map_cfg = load_json(os.path.join(DATA_DIR, "map_settings.json"), {
+    "enable_map": True, "size_by": "global_score", "export_geojson": True, "crs": "EPSG:4326", "skip_map_option": True
+})
+
+try:
+    df_cat = load_categories_from_excel(os.path.join(DATA_DIR, "Main categories and sub criteria.xlsx"))
+except Exception as e:
+    st.error(f"Excel yüklenemedi: {e}")
+    st.stop()
+
+mandatory_docx = os.path.join(DATA_DIR, "Mandatory Criteria Questions.docx")
+try:
+    mandatory_lines = load_docx_lines(mandatory_docx)
+except Exception as e:
+    st.error(f"Mandatory DOCX okunamadı: {e}")
+    st.stop()
+
+# Alt kriter ağaç ağırlıkları (rank ölçekli)
+weight_tree = build_scaled_subcriterion_weights(df_cat, ranks_cfg)
+
+# ---------- Sidebar: Navigation & Save/Load
+
+st.sidebar.title("Navigation")
+step = st.sidebar.radio(
+    "Go to step",
+    ["1) Project Setup",
+     "2) Mandatory Screening",
+     "3) Pairwise (by Sub-criterion)",
+     "4) Aggregate & Rank",
+     "5) Outputs & Report",
+     "⚙️ Save / Load / Inspect"]
+)
+
+with st.sidebar.expander("💾 Save / Export", expanded=False):
+    if st.button("Save current session"):
+        S["last_saved"] = datetime.utcnow().isoformat() + "Z"
+        payload = json.dumps(S, indent=2)
+        st.download_button("Download state.json", data=payload, file_name=f"ahp_state_{int(time.time())}.json", mime="application/json")
+
+with st.sidebar.expander("📥 Load / Import", expanded=False):
+    up = st.file_uploader("Upload a previously saved state.json", type=["json"])
+    if up is not None:
+        try:
+            st.session_state.S = json.load(up)
+            S = st.session_state.S
+            st.success("State loaded.")
+        except Exception as e:
+            st.error(f"Load failed: {e}")
+
+# ---------- STEP 1: Project Setup
+if step.startswith("1"):
+    st.title("1) User & Project Setup")
+    S["project_name"] = st.text_input("Project name (optional)", value=S.get("project_name") or meta.get("project_default_name",""))
+
+    st.subheader("Locations")
+    count = st.number_input("How many locations do you want to compare?", min_value=2, max_value=12,
+                            value=max(2, len(S["locations"]) or 3), step=1)
+
+    # liste uzunluğunu ayarla
+    while len(S["locations"]) < count:
+        S["locations"].append({"name": f"Camp {chr(65+len(S['locations']))}", "lat": None, "lon": None})
+    if len(S["locations"]) > count:
+        S["locations"] = S["locations"][:count]
+
+    for i, loc in enumerate(S["locations"]):
+        with st.container(border=True):
+            S["locations"][i]["name"] = st.text_input(f"Location {i+1} name", value=loc["name"], key=f"nm_{i}")
+            c1, c2 = st.columns(2)
+            with c1:
+                lat = st.text_input(f"{S['locations'][i]['name']} latitude (optional)", value="" if loc["lat"] is None else str(loc["lat"]), key=f"lat_{i}")
+            with c2:
+                lon = st.text_input(f"{S['locations'][i]['name']} longitude (optional)", value="" if loc["lon"] is None else str(loc["lon"]), key=f"lon_{i}")
+            # parse
+            try:
+                S["locations"][i]["lat"] = float(lat) if lat != "" else None
+            except: S["locations"][i]["lat"] = None
+            try:
+                S["locations"][i]["lon"] = float(lon) if lon != "" else None
+            except: S["locations"][i]["lon"] = None
+
+    st.info("Koordinatlar opsiyoneldir; Step 5'te harita için kullanılır.")
+
+# ---------- STEP 2: Mandatory Screening
+elif step.startswith("2"):
+    st.title("2) Mandatory Criteria Screening (YES / NO / CONDITIONAL)")
+    st.caption("Aşağıdaki ifadeler lokasyonun uygunluğu için zorunludur. 'NO' işaretlenen lokasyonlar elenir. 'CONDITIONAL' varsayılan olarak dahil edilir ve raporda uyarı verilir.")
+
+    if not S["locations"]:
+        st.warning("Önce Step 1'de en az 2 lokasyon ekleyin.")
+        st.stop()
+
+    # Soru listesini göster
+    st.write("**Mandatory Questions (from DOCX):**")
+    for i, q in enumerate(mandatory_lines, start=1):
+        st.write(f"{i}. {q}")
+
+    # Cevaplar
+    for loc in S["locations"]:
+        lname = loc["name"]
+        S["mandatory"].setdefault(lname, {})
+        with st.expander(f"{lname}"):
+            for idx, q in enumerate(mandatory_lines):
+                qid = f"q{idx+1}"
+                default = S["mandatory"][lname].get(qid, "YES")
+                ans = st.radio(q, ["YES","NO","CONDITIONAL"], horizontal=True, index=["YES","NO","CONDITIONAL"].index(default), key=f"{lname}_{qid}")
+                S["mandatory"][lname][qid] = ans
+
+    # Aktif lokasyonları hesapla
+    active, eliminated, conditional = [], [], []
+    for loc in S["locations"]:
+        lname = loc["name"]
+        answers = S["mandatory"].get(lname, {})
+        if any(a == "NO" for a in answers.values()) or len(answers)==0:
+            eliminated.append(lname)
+        else:
+            active.append(lname)
+            if any(a == "CONDITIONAL" for a in answers.values()):
+                conditional.append(lname)
+    S["active_locations"] = active
+
+    c1,c2,c3 = st.columns(3)
+    with c1: st.success(f"Active: {', '.join(active) if active else 'None'}")
+    with c2: st.warning(f"Eliminated (NO): {', '.join(eliminated) if eliminated else 'None'}")
+    with c3:
+        if conditional:
+            st.info(f"Conditional: {', '.join(conditional)} (rapora uyarı olarak eklenecek)")
+
+# ---------- STEP 3: Pairwise
+elif step.startswith("3"):
+    st.title("3) Pairwise Comparison — by Sub-criterion (Saaty 1–9)")
+    names = S.get("active_locations") or [l["name"] for l in S["locations"]]
+    if len(names) < 2:
+        st.warning("En az iki 'Active' lokasyon gerekli. Step 2'yi kontrol edin.")
+        st.stop()
+
+    # Alt kriterleri düz listeye aç
+    sublist = []
+    for cat, subs in weight_tree.items():
+        for sc, w in subs.items():
+            sublist.append((cat, sc, w))
+
+    # İlerleme bilgisi
+    done_count = sum(1 for (cat, sc, _) in sublist if f"{cat} :: {sc}" in S["local_weights"])
+    st.progress(done_count / max(1,len(sublist)))
+    st.caption(f"Tamamlanan alt kriter: {done_count}/{len(sublist)}")
+
+    with st.expander("Saaty ölçeği (1–9) açıklaması", expanded=False):
+        st.write("""
+1 = Eşit önem  
+3 = Az daha önemli  
+5 = Açıkça daha önemli  
+7 = Çok daha önemli  
+9 = Kesinlikle baskın  
+2,4,6,8 = Ara değerler
+""")
+
+    # Her alt kriter için arayüz
+    for (cat, sc, fixed_w) in sublist:
+        key = f"{cat} :: {sc}"
+        with st.container(border=True):
+            st.subheader(key)
+            st.caption(f"Fixed sub-weight (scaled): **{fixed_w:.4f}**")
+            S["pairwise"].setdefault(key, {"pairs": {}})
+
+            n = len(names)
+            for i in range(n):
+                for j in range(i+1, n):
+                    left, right = names[i], names[j]
+                    cols = st.columns([2,2,2,2])
+                    with cols[0]:
+                        choice = st.radio(f"Which location performs better on '{sc}'?", [left,"Equal",right], key=f"{key}_c_{i}_{j}", horizontal=True)
+                    with cols[1]:
+                        intensity = st.slider("Intensity (1–9)", 1, 9, 3, key=f"{key}_s_{i}_{j}")
+                    if choice == "Equal":
+                        S["pairwise"][key]["pairs"][(i,j)] = (i, 1)
+                    elif choice == left:
+                        S["pairwise"][key]["pairs"][(i,j)] = (i, intensity)
+                    else:
+                        S["pairwise"][key]["pairs"][(i,j)] = (j, intensity)
+
+            # Hesapla
+            A, wloc, CR = ahp_from_pairs(names, S["pairwise"][key]["pairs"])
+            S["local_weights"][key] = wloc
+            S["pairwise"][key]["CR"] = CR
+
+            st.write(pd.DataFrame(A, index=names, columns=names))
+            st.write(pd.DataFrame({"Local Weight": wloc}).T)
+            if CR > 0.10:
+                st.error(f"CR = {CR:.3f} (> 0.10). Yargıları gözden geçirmen önerilir.")
+            else:
+                st.success(f"CR = {CR:.3f} (kabul edilebilir)")
+
+# ---------- STEP 4: Aggregate & Rank
+elif step.startswith("4"):
+    st.title("4) Aggregate & Rank")
+
+    names = S.get("active_locations") or [l["name"] for l in S["locations"]]
+    if len(names) < 2:
+        st.warning("En az iki 'Active' lokasyon gerekli.")
+        st.stop()
+
+    # alt kriterleri anahtarlarıyla çıkar
+    subs = []
+    for cat, subs_dict in weight_tree.items():
+        for sc, fixed_w in subs_dict.items():
+            subs.append((cat, sc, fixed_w, f"{cat} :: {sc}"))
+
+    global_scores = {n: 0.0 for n in names}
+    category_breakdown = {n: {cat: 0.0 for cat in weight_tree.keys()} for n in names}
+
+    for (cat, sc, fixed_w, key) in subs:
+        local = S["local_weights"].get(key)
+        if not local:
+            continue
+        for n in names:
+            lw = float(local.get(n, 0.0))
+            global_scores[n] += lw * fixed_w
+            category_breakdown[n][cat] += lw * fixed_w
+
+    # normalize sunum için
+    total = sum(global_scores.values())
+    if total > 0:
+        for k in global_scores: global_scores[k] /= total
+        for n in category_breakdown:
+            for cat in category_breakdown[n]:
+                category_breakdown[n][cat] /= total
+
+    S["global_scores"] = global_scores
+    S["category_breakdown"] = category_breakdown
+
+    # tablo + top3
+    df_rank = pd.DataFrame({"Global Score": global_scores}).sort_values("Global Score", ascending=False)
+    st.dataframe(df_rank.style.format({"Global Score":"{:.4f}"}))
+    top3 = list(df_rank.index)[:3]
+    st.success(f"Top 3 Locations: {', '.join(top3)}")
+
+# ---------- STEP 5: Outputs & Report
+elif step.startswith("5"):
+    st.title("5) Outputs & Visualisation")
+
+    scores = S.get("global_scores", {})
+    breakdown = S.get("category_breakdown", {})
+    if not scores:
+        st.warning("Önce Step 4'te skorları üretin.")
+        st.stop()
+
+    # Bar chart
+    st.subheader("Global Score Comparison (Bar)")
+    fig_bar = go.Figure(go.Bar(x=list(scores.keys()), y=list(scores.values())))
+    fig_bar.update_layout(xaxis_title="Location", yaxis_title="Global Score")
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+    # Radar chart (category breakdown)
+    st.subheader("Category Performance (Radar)")
+    cats = list(weight_tree.keys())
+    fig_rad = go.Figure()
+    for n in scores.keys():
+        r_vals = [breakdown[n].get(c, 0.0) for c in cats]
+        r_vals.append(r_vals[0])
+        cats_close = cats + [cats[0]]
+        fig_rad.add_trace(go.Scatterpolar(r=r_vals, theta=cats_close, fill="toself", name=n))
+    fig_rad.update_layout(polar=dict(radialaxis=dict(visible=True)), showlegend=True)
+    st.plotly_chart(fig_rad, use_container_width=True)
+
+    # Mandatory özet tablosu
+    st.subheader("Mandatory Criteria Summary")
+    mand_rows = []
+    for loc in S["locations"]:
+        lname = loc["name"]
+        row = {"Location": lname}
+        for idx, _ in enumerate(load_docx_lines(os.path.join(DATA_DIR, "Mandatory Criteria Questions.docx"))):
+            qid = f"q{idx+1}"
+            row[qid] = S["mandatory"].get(lname, {}).get(qid, "-")
+        mand_rows.append(row)
+    df_mand = pd.DataFrame(mand_rows)
+    st.dataframe(df_mand)
+
+    # Harita (opsiyonel)
+    if map_cfg.get("enable_map", True):
+        st.subheader("Geovisualization (optional)")
+        if any(l.get("lat") is not None for l in S["locations"]) and any(l.get("lon") is not None for l in S["locations"]):
+            map_df = pd.DataFrame([{
+                "lat": loc.get("lat"),
+                "lon": loc.get("lon"),
+                "name": loc.get("name"),
+                "score": scores.get(loc.get("name"), 0.0)
+            } for loc in S["locations"] if loc.get("lat") is not None and loc.get("lon") is not None])
+            st.map(map_df, latitude="lat", longitude="lon", size="score")
+            # GeoJSON indir
+            if map_cfg.get("export_geojson", True):
+                gj = {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {"type":"Feature",
+                         "properties":{"name": r["name"], "score": r["score"]},
+                         "geometry":{"type":"Point","coordinates":[r["lon"], r["lat"]]}}
+                        for _, r in map_df.iterrows()
+                    ]
+                }
+                st.download_button("Download GeoJSON", data=json.dumps(gj, indent=2),
+                                   file_name="locations.geojson", mime="application/geo+json")
+        else:
+            st.caption("Harita için Step 1'de koordinat giriniz.")
+
+    # PDF rapor
+    st.subheader("PDF Report")
+    # grafikleri dosyaya kaydet
+    bar_path = os.path.join(OUT_DIR, f"bar_{int(time.time())}.png")
+    rad_path = os.path.join(OUT_DIR, f"rad_{int(time.time())}.png")
+    fig_bar.write_image(bar_path, engine="kaleido", scale=2)
+    fig_rad.write_image(rad_path, engine="kaleido", scale=2)
+
+    pdf_path = os.path.join(OUT_DIR, f"report_{int(time.time())}.pdf")
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    W, H = A4
+    y = H - 40
+
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, y, meta.get("project_default_name", APP_TITLE)); y -= 18
+    c.setFont("Helvetica", 10)
+    c.drawString(40, y, f"Generated: {datetime.utcnow().isoformat()}Z"); y -= 14
+    c.drawString(40, y, f"Author: {meta.get('author','')}   Org: {meta.get('org_name','')}"); y -= 18
+
+    # Global table
+    c.setFont("Helvetica-Bold", 12); c.drawString(40, y, "Global Scores"); y -= 14
+    c.setFont("Helvetica", 9)
+    for name, sc in sorted(scores.items(), key=lambda x: x[1], reverse=True):
+        c.drawString(50, y, f"{name}: {sc:.4f}"); y -= 12
+
+    y -= 10
+    # Bar chart
+    try:
+        c.drawImage(ImageReader(bar_path), 40, max(60, y-220), width=520, height=220, preserveAspectRatio=True, anchor='nw')
+        y -= 240
+    except: pass
+
+    # Radar chart
+    try:
+        c.drawImage(ImageReader(rad_path), 40, max(60, y-220), width=520, height=220, preserveAspectRatio=True, anchor='nw')
+        y -= 240
+    except: pass
+
+    # Mandatory kısa özet
+    y -= 10
+    c.setFont("Helvetica-Bold", 12); c.drawString(40, y, "Mandatory Summary"); y -= 14
+    c.setFont("Helvetica", 8)
+    for _, r in df_mand.iterrows():
+        loc = r["Location"]
+        vals = [v for k,v in r.items() if k!="Location"]
+        c.drawString(50, y, f"{loc}: " + ", ".join(vals[:6]) + ("..." if len(vals)>6 else ""))
+        y -= 10
+        if y < 80: c.showPage(); y = H - 40
+
+    # Footer
+    c.setFont("Helvetica", 8)
+    c.drawString(40, 40, meta.get("footer_note",""))
+    c.save()
+
+    st.success("PDF oluşturuldu.")
+    with open(pdf_path, "rb") as f:
+        st.download_button("Download PDF", data=f.read(), file_name=os.path.basename(pdf_path), mime="application/pdf")
+
+# ---------- SETTINGS
+else:
+    st.title("⚙️ Save / Load / Inspect")
+    st.write("**Fixed sub-criterion weights (scaled by category ranks)**")
+    rows = []
+    for cat, subs in weight_tree.items():
+        for sc, w in subs.items():
+            rows.append({"Category": cat, "Sub-criterion": sc, "Weight": w})
+    st.dataframe(pd.DataFrame(rows).sort_values(["Category","Sub-criterion"]))
+
+    st.write("**Current session keys**")
+    st.json(S)
+

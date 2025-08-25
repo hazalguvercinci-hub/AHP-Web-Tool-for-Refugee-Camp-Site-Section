@@ -1,0 +1,13 @@
+﻿{
+    "project_default_name": "Refugee Camp Site Feasibility",
+    "org_name": "University of Warwick",
+    "author": "Hazal Guvercinci",
+    "include_conditional_notes": true,
+    "language": "en",
+    "date_format": "YYYY-MM-DD",
+    "footer_note": "This tool supports field decision-making; references: Sphere & UNHCR.",
+    "references": [
+        {"label": "Sphere (2018) WASH & Shelter", "url": "https://spherestandards.org"},
+        {"label": "UNHCR Site Planning Handbook", "url": "https://www.unhcr.org"}
+    ]
+}
