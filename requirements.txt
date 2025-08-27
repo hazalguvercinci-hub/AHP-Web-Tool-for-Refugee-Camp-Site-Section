@@ -5,3 +5,4 @@ plotly
 openpyxl
 matplotlib
 reportlab
+python-docx
