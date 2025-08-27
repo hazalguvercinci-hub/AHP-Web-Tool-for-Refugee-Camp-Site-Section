@@ -527,16 +527,35 @@ elif step.startswith("5"):
         with open(path, "rb") as fh:
             st.download_button("📥 Download selected DXF", data=fh, file_name=fname, mime="application/octet-stream")
 
-# ---------- SETTINGS
+# ---------- SETTINGS / INSPECT
 
 else:
     st.title("⚙️ Save / Load / Inspect")
+
+    # Fixed sub-criterion weights (rank-scaled)
     st.write("**Fixed sub-criterion weights (scaled by category ranks)**")
     rows = []
     for cat, subs in weight_tree.items():
         for sc, w in subs.items():
             rows.append({"Category": cat, "Sub-criterion": sc, "Weight": w})
-    st.dataframe(pd.DataFrame(rows).sort_values(["Category","Sub-criterion"]))
+    st.dataframe(pd.DataFrame(rows).sort_values(["Category", "Sub-criterion"]))
 
+    # --- NEW: Expert Weights Table ---
+    st.write("**Expert-derived AHP Weights (from 5 experts)**")
+    try:
+        df_expert = pd.read_excel(os.path.join(DATA_DIR, "expert_global_weights.xlsx"))
+        st.dataframe(df_expert, use_container_width=True)
+        st.markdown(
+            "These weights represent the results of an Analytic Hierarchy Process (AHP) "
+            "conducted with five domain experts. They reflect the relative importance "
+            "of each criterion and category in camp site selection. "
+            "If you wish to use them directly, multiply each location’s local sub-criterion "
+            "weight with the corresponding global weight from the table. "
+            "Summing across all criteria yields the final global score."
+        )
+    except Exception as e:
+        st.warning(f"Expert weights file could not be loaded: {e}")
+
+    # Current session keys
     st.write("**Current session keys**")
     st.json(S)
