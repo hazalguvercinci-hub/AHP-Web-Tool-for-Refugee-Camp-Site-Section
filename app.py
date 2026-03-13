@@ -454,8 +454,8 @@ elif step.startswith("5"):
     st.subheader("PDF Report")
     bar_path = os.path.join(OUT_DIR, f"bar_{int(time.time())}.png")
     rad_path = os.path.join(OUT_DIR, f"rad_{int(time.time())}.png")
-    fig_bar.write_image(bar_path, engine="kaleido", scale=2)
-    fig_rad.write_image(rad_path, engine="kaleido", scale=2)
+    fig_bar.write_image(bar_path, scale=2)
+    fig_rad.write_image(rad_path, scale=2)
 
     pdf_path = os.path.join(OUT_DIR, f"report_{int(time.time())}.pdf")
     c = canvas.Canvas(pdf_path, pagesize=A4)
@@ -470,17 +470,21 @@ elif step.startswith("5"):
     y -= 10
     try:
         c.drawImage(ImageReader(bar_path), 40, max(60, y-220), width=520, height=220, preserveAspectRatio=True, anchor='nw'); y -= 240
-    except: pass
+    except:
+        pass
     try:
         c.drawImage(ImageReader(rad_path), 40, max(60, y-220), width=520, height=220, preserveAspectRatio=True, anchor='nw'); y -= 240
-    except: pass
+    except:
+        pass
     y -= 10
     c.setFont("Helvetica-Bold", 12); c.drawString(40, y, "Mandatory Summary"); y -= 14
     c.setFont("Helvetica", 8)
     for _, r in df_mand.iterrows():
         loc = r["Location"]; vals = [v for k,v in r.items() if k!="Location"]
         c.drawString(50, y, f"{loc}: " + ", ".join(vals[:6]) + ("..." if len(vals)>6 else "")); y -= 10
-        if y < 80: c.showPage(); y = H - 40
+        if y < 80:
+            c.showPage()
+            y = H - 40
     c.setFont("Helvetica", 8); c.drawString(40, 40, meta.get("footer_note","")); c.save()
     st.success("PDF generated.")
     with open(pdf_path, "rb") as f:
@@ -512,7 +516,8 @@ elif step.startswith("5"):
             for i, f in enumerate(available_dxf):
                 base = os.path.splitext(f)[0].strip().lower()
                 if base in [n.strip().lower() for n in S["active_locations"]]:
-                    pref_index = i; break
+                    pref_index = i
+                    break
 
     if not available_dxf and uploaded_path is None:
         st.info("Place your AutoCAD drawings (.dxf) into data/layouts/ to enable downloads.")
