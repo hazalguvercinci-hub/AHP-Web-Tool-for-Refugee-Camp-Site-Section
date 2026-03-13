@@ -2,6 +2,7 @@ streamlit>=1.36
 pandas
 numpy
 plotly
+kaleido
 openpyxl
 matplotlib
 reportlab
